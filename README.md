@@ -1,5 +1,7 @@
 ## Code for paper "A Lightweight Method for Tackling Unknown Participation Statistics in Federated Averaging"
 
+This is the official code for the paper S. Wang, M. Ji, "[A lightweight method for tackling unknown participation statistics in federated averaging](https://arxiv.org/abs/2306.03401)," in International Conference on Learning Representations (ICLR) 2024.
+
 The code was run successfully in the following environment: Python 3.9, PyTorch 1.13.1, Torchvision 0.14.1
 
 See `config.py` for all the configurations. Some examples on reproducing the CIFAR-10 results (with 5 different random seeds) and Bernoulli participation are as follows.
