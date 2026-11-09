@@ -120,7 +120,7 @@ if __name__ == "__main__":
                     step_size_local /= 2
                     model.update_learning_rate(step_size_local)
 
-            print('seed', seed, ' - iteration', num_iter, ' - local step size', step_size_local)
+  
             accumulated = 0
 
             for n in range(n_nodes):

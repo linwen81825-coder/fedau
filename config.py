@@ -46,7 +46,7 @@ parser.add_argument('-save-final-model', type=int, default=1)
 
 args = parser.parse_args()
 
-print(', '.join(f'{k}={v}' for k, v in vars(args).items()))
+
 
 weighting_method = args.weighting
 k_value = args.k_adaptive
@@ -85,7 +85,7 @@ max_iter = args.iters_total
 simulations_str = args.seeds.split(',')
 simulations = [int(i) for i in simulations_str]
 
-dataset_file_path = os.path.join(os.path.dirname(__file__), 'data_files')
+dataset_file_path = '/home/lw/Project/dataset'
 
 data_dirichlet_alpha = args.data_dirichlet_alpha
 participation_dirichlet_alpha = args.participation_dirichlet_alpha

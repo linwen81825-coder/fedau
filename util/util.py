@@ -105,7 +105,7 @@ def data_participation_each_node(data_train, n_nodes):
     participation_scaling = participation_prob_mean * num_labels
     participation_prob_each_node = [np.sum(np.multiply(actual_label_distributions_each_node[n], participation_prob_multiplier)) * participation_scaling for n in range(n_nodes)]
     participation_prob_each_node = np.maximum(participation_prob_min, participation_prob_each_node)
-    print('participation_prob_each_node:', participation_prob_each_node, flush=True)
+
     return dict_users, participation_prob_each_node
 
 
