@@ -20,7 +20,11 @@ parser.add_argument('-save-weight-stats', type=int, default=0)
 parser.add_argument('-lr', type=float, default=0.1)  # local learning rate of clients
 parser.add_argument('-lr-global', type=float, default=1.0)  # global learning rate
 parser.add_argument('-minibatch', type=int, default=16)
-
+parser.add_argument(
+    '-moe-aux-loss-weight',
+    type=float,
+    default=0.01
+)
 parser.add_argument('-lr-decay-start-iter', type=int, default=50000)  # start decaying learning rate at this iteration
 parser.add_argument('-lr-decay-interval', type=int, default=5000)  # decay local learning rate by 2 at this interval, for a maximum of 10 times
 
@@ -47,7 +51,7 @@ parser.add_argument('-save-final-model', type=int, default=1)
 args = parser.parse_args()
 
 print(', '.join(f'{k}={v}' for k, v in vars(args).items()))
-
+moe_aux_loss_weight = args.moe_aux_loss_weight
 weighting_method = args.weighting
 k_value = args.k_adaptive
 participation_method = args.participation
@@ -85,7 +89,7 @@ max_iter = args.iters_total
 simulations_str = args.seeds.split(',')
 simulations = [int(i) for i in simulations_str]
 
-dataset_file_path = os.path.join(os.path.dirname(__file__), 'data_files')
+dataset_file_path = '/home/lw/Project/dataset'
 
 data_dirichlet_alpha = args.data_dirichlet_alpha
 participation_dirichlet_alpha = args.participation_dirichlet_alpha
@@ -113,7 +117,10 @@ else:
     results_file_prefix = args.out + '_' + dataset + '_' + model_name + '_' + weighting_method + '_' + participation_method + '_lr' + str(step_size_local_config) + \
                           '_lr_global' + str(step_size_global) + '_dataAlpha' + str(data_dirichlet_alpha) + \
                           '_partAlpha' + str(participation_dirichlet_alpha)
-
+if model_name == 'ModelCNNCifar10':
+    results_file_prefix += (
+        '_MoE4_aux' + str(moe_aux_loss_weight)
+    )
 save_model_file = results_file_prefix + '.model'
 if args.pretrained_model != '':
     load_model_file = args.pretrained_model

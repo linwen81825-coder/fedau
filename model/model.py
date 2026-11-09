@@ -57,20 +57,59 @@ class Model:
         self.learning_rate = learning_rate
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=learning_rate)
 
+
     def _get_weight_info(self):
         self.weights_key_list = []
         self.weights_size_list = []
         self.weights_num_list = []
+
         state = self.model.state_dict()
+
         for k, v in state.items():
             shape = list(v.size())
+
             self.weights_key_list.append(k)
             self.weights_size_list.append(shape)
+
             if len(shape) > 0:
                 num_w = reduce(lambda x, y: x * y, shape)
             else:
-                num_w=0
+                num_w = 0
+
             self.weights_num_list.append(num_w)
+
+        # =====================================
+        # 专家参数与非专家参数的索引划分
+        # =====================================
+
+        total_dim = sum(self.weights_num_list)
+
+        # True 表示专家参数，False 表示非专家参数
+        self.expert_weight_mask = torch.zeros(
+            total_dim,
+            dtype=torch.bool
+        )
+
+        start_index = 0
+
+        for key, num_w in zip(
+            self.weights_key_list,
+            self.weights_num_list
+        ):
+
+            end_index = start_index + num_w
+
+            # 所有 experts.* 参数都归入专家参数
+            if key.startswith('experts.'):
+                self.expert_weight_mask[
+                    start_index:end_index
+                ] = True
+
+            start_index = end_index
+
+        # 非专家参数
+        self.non_expert_weight_mask = ~self.expert_weight_mask
+
 
     def get_weight_dimension(self):
         dim = sum(self.weights_num_list)
@@ -89,6 +128,96 @@ class Model:
                 return weight_flatten_tensor
             else:
                 return copy.deepcopy(state)
+
+    def split_weight(self, weight):
+        """
+        将完整模型参数拆分为：
+        1. 非专家参数
+        2. 专家参数
+        """
+
+        if not self.flatten_weight:
+            raise RuntimeError(
+                "split_weight requires flatten_weight=True"
+            )
+
+        if weight.numel() != self.get_weight_dimension():
+            raise ValueError("模型参数维度不匹配")
+
+        expert_mask = self.expert_weight_mask.to(weight.device)
+
+        non_expert_weight = weight[~expert_mask]
+        expert_weight = weight[expert_mask]
+
+        return non_expert_weight, expert_weight
+
+
+    def combine_weight(self, non_expert_weight, expert_weight):
+        """
+        将非专家参数和专家参数重新组合成完整模型参数。
+        """
+
+        if not self.flatten_weight:
+            raise RuntimeError(
+                "combine_weight requires flatten_weight=True"
+            )
+
+        if non_expert_weight.device != expert_weight.device:
+            raise ValueError("两组参数必须位于同一设备")
+
+        if non_expert_weight.dtype != expert_weight.dtype:
+            raise ValueError("两组参数的数据类型必须一致")
+
+        non_mask = self.non_expert_weight_mask.to(
+            non_expert_weight.device
+        )
+
+        expert_mask = self.expert_weight_mask.to(
+            expert_weight.device
+        )
+
+        expected_non = int(non_mask.sum().item())
+        expected_expert = int(expert_mask.sum().item())
+
+        if non_expert_weight.numel() != expected_non:
+            raise ValueError("非专家参数数量不匹配")
+
+        if expert_weight.numel() != expected_expert:
+            raise ValueError("专家参数数量不匹配")
+
+        full_weight = torch.empty(
+            self.get_weight_dimension(),
+            dtype=non_expert_weight.dtype,
+            device=non_expert_weight.device
+        )
+
+        full_weight[non_mask] = non_expert_weight
+        full_weight[expert_mask] = expert_weight
+
+        return full_weight
+
+
+    def get_weight_groups(self):
+        """
+        获取当前模型的两组参数。
+        """
+
+        weight = self.get_weight()
+
+        return self.split_weight(weight)
+
+
+    def assign_weight_groups(self, non_expert_weight, expert_weight):
+        """
+        将两组参数重新组合并赋值给模型。
+        """
+
+        full_weight = self.combine_weight(
+            non_expert_weight,
+            expert_weight
+        )
+
+        self.assign_weight(full_weight)
 
     def assign_weight(self, w):
         if self.flatten_weight:
