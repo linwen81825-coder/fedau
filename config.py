@@ -10,6 +10,18 @@ parser.add_argument('-pretrained-model', type=str, default='')
 parser.add_argument('-out', type=str, default='results')
 
 parser.add_argument('-weighting', type=str, default='adaptive')  # adaptive, average_participating, average_all, fedvarp, mifa, known_prob
+parser.add_argument(
+    '-aggregation-scheme',
+    type=str,
+    default='shared_avg_expert_au',
+    choices=[
+        'fedavg_all',
+        'fedau_all',
+        'shared_avg_expert_au',
+        'shared_au_expert_avg'
+    ],
+    help='Parameter-wise aggregation scheme used when -weighting adaptive.'
+)
 parser.add_argument('-k-adaptive', type=int, default=100000)  # cutoff interval length, only used by the adaptive method
 parser.add_argument('-participation', type=str, default='bernoulli')  # bernoulli,
                                                                       # markov-0.05 (where 0.05 specifies maximum transition to active probability and can be changed),
@@ -49,6 +61,7 @@ args = parser.parse_args()
 
 
 weighting_method = args.weighting
+aggregation_scheme = args.aggregation_scheme
 k_value = args.k_adaptive
 participation_method = args.participation
 
@@ -113,6 +126,8 @@ else:
     results_file_prefix = args.out + '_' + dataset + '_' + model_name + '_' + weighting_method + '_' + participation_method + '_lr' + str(step_size_local_config) + \
                           '_lr_global' + str(step_size_global) + '_dataAlpha' + str(data_dirichlet_alpha) + \
                           '_partAlpha' + str(participation_dirichlet_alpha)
+
+results_file_prefix += '_scheme_' + aggregation_scheme
 
 save_model_file = results_file_prefix + '.model'
 if args.pretrained_model != '':

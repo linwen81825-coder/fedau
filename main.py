@@ -156,11 +156,61 @@ if __name__ == "__main__":
         assert expert_mask.numel() == w_global.numel(), \
             "Expert mask dimension does not match model weights!"
 
-        # 只有模型确实包含专家参数时，才启用混合聚合
-        use_hybrid_adaptive = (
-            weighting_method == 'adaptive'
-            and torch.any(expert_mask).item()
-        )
+        # ========================================================
+        # 根据 aggregation_scheme 选择 FedAvg / FedAU 参数掩码
+        #
+        # fedavg_all:
+        #   Backbone + Router + Experts 全部使用 FedAvg
+        # fedau_all:
+        #   Backbone + Router + Experts 全部使用原始 FedAU
+        # shared_avg_expert_au:
+        #   非专家参数 FedAvg，专家参数 FedAU
+        # shared_au_expert_avg:
+        #   非专家参数 FedAU，专家参数 FedAvg
+        # ========================================================
+
+        use_scheme_aggregation = (weighting_method == 'adaptive')
+
+        if use_scheme_aggregation:
+
+            has_expert = torch.any(expert_mask).item()
+            has_shared = torch.any(shared_mask).item()
+
+            if aggregation_scheme in (
+                'shared_avg_expert_au',
+                'shared_au_expert_avg'
+            ) and (not has_expert or not has_shared):
+                raise ValueError(
+                    'The selected aggregation scheme requires both '
+                    'expert and non-expert parameters. Check '
+                    'Model.get_expert_weight_mask() and the model names.'
+                )
+
+            if aggregation_scheme == 'fedavg_all':
+                fedavg_mask = torch.ones_like(expert_mask)
+                fedau_mask = torch.zeros_like(expert_mask)
+
+            elif aggregation_scheme == 'fedau_all':
+                fedavg_mask = torch.zeros_like(expert_mask)
+                fedau_mask = torch.ones_like(expert_mask)
+
+            elif aggregation_scheme == 'shared_avg_expert_au':
+                fedavg_mask = shared_mask
+                fedau_mask = expert_mask
+
+            elif aggregation_scheme == 'shared_au_expert_avg':
+                fedavg_mask = expert_mask
+                fedau_mask = shared_mask
+
+            else:
+                raise ValueError(
+                    'Unknown aggregation scheme: '
+                    + str(aggregation_scheme)
+                )
+
+        else:
+            fedavg_mask = None
+            fedau_mask = None
 
         num_iter = 0
 
@@ -255,16 +305,16 @@ if __name__ == "__main__":
 
             accumulated = 0
 
-            if use_hybrid_adaptive:
+            if use_scheme_aggregation:
 
-                # 非专家参数：FedAvg 累积
-                shared_update_sum = torch.zeros_like(w_global)
+                # FedAvg 参数的未加权更新累积
+                fedavg_update_sum = torch.zeros_like(w_global)
 
-                # 专家参数：FedAU 累积
-                expert_update_sum = torch.zeros_like(w_global)
+                # FedAU 参数的参与间隔加权更新累积
+                fedau_update_sum = torch.zeros_like(w_global)
 
-                # 本轮实际参与的客户端数量
-                shared_participating_count = 0
+                # 本轮实际参与训练的客户端数量
+                participating_count = 0
 
             # ====================================================
             # 客户端本地训练
@@ -338,14 +388,14 @@ if __name__ == "__main__":
                                 participate_intervals_at_node[n]
                             )
 
-                            if use_hybrid_adaptive:
+                            if use_scheme_aggregation:
 
-                                # 只对专家参数应用 FedAU 权重
-                                w_tmp[expert_mask] *= agg_weight
+                                # 只对本实验方案中指定为 FedAU 的参数加权
+                                w_tmp[fedau_mask] *= agg_weight
 
                             else:
 
-                                # 非 MoE 模型保留原始 Adaptive FedAU
+                                # 兼容未启用参数级聚合方案的原始逻辑
                                 w_tmp *= agg_weight
 
                     elif weighting_method == 'fedvarp':
@@ -425,27 +475,21 @@ if __name__ == "__main__":
                 # 核心修改：两种参数分别累积
                 # =================================================
 
-                if use_hybrid_adaptive:
+                if use_scheme_aggregation:
 
                     if participated:
 
-                        # -----------------------------------------
-                        # 非专家参数：不使用 FedAU 权重
-                        # -----------------------------------------
-
-                        shared_update_sum[shared_mask] += (
-                            w_tmp[shared_mask]
+                        # FedAvg 参数：累积原始客户端更新，不乘 FedAU 权重
+                        fedavg_update_sum[fedavg_mask] += (
+                            w_tmp[fedavg_mask]
                         )
 
-                        # -----------------------------------------
-                        # 专家参数：使用 FedAU 加权后的更新
-                        # -----------------------------------------
-
-                        expert_update_sum[expert_mask] += (
-                            w_tmp[expert_mask]
+                        # FedAU 参数：累积上面已经按参与间隔加权的更新
+                        fedau_update_sum[fedau_mask] += (
+                            w_tmp[fedau_mask]
                         )
 
-                        shared_participating_count += 1
+                        participating_count += 1
 
                 elif weighting_method != 'mifa':
 
@@ -486,29 +530,30 @@ if __name__ == "__main__":
             # 核心修改：分别聚合非专家参数和专家参数
             # ====================================================
 
-            if use_hybrid_adaptive:
+            if use_scheme_aggregation:
 
                 w_tmp_a = torch.zeros_like(w_global)
 
                 # ------------------------------------------------
-                # 1. 非专家参数：FedAvg
-                # 除以本轮实际参与训练的客户端数量
+                # FedAvg 参数：
+                # 对本轮实际参与训练的客户端更新求平均
                 # ------------------------------------------------
 
-                if shared_participating_count > 0:
+                if participating_count > 0:
 
-                    w_tmp_a[shared_mask] = (
-                        shared_update_sum[shared_mask]
-                        / shared_participating_count
+                    w_tmp_a[fedavg_mask] = (
+                        fedavg_update_sum[fedavg_mask]
+                        / participating_count
                     )
 
                 # ------------------------------------------------
-                # 2. 专家参数：Adaptive FedAU
-                # 保留原始 FedAU 的总客户端数归一化
+                # FedAU 参数：
+                # 使用原始 Adaptive FedAU 的总客户端数归一化
+                # 未参与客户端的更新视为零
                 # ------------------------------------------------
 
-                w_tmp_a[expert_mask] = (
-                    expert_update_sum[expert_mask] / n_nodes
+                w_tmp_a[fedau_mask] = (
+                    fedau_update_sum[fedau_mask] / n_nodes
                 )
 
             elif weighting_method != 'mifa':
@@ -621,7 +666,7 @@ if __name__ == "__main__":
         del model
         del w_global
 
-        if weighting_method != 'mifa' and not use_hybrid_adaptive:
+        if weighting_method != 'mifa' and not use_scheme_aggregation:
 
             del w_accumulate
 
