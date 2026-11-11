@@ -2,7 +2,10 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(
+    0,
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+)
 
 import torch
 import torch.nn as nn
@@ -14,7 +17,9 @@ import torch.nn.functional as F
 # ============================================================
 
 class Expert(nn.Module):
+
     def __init__(self, num_classes=10):
+
         super(Expert, self).__init__()
 
         self.fc1 = nn.Sequential(
@@ -28,8 +33,10 @@ class Expert(nn.Module):
         self.fc2 = nn.Linear(64, num_classes)
 
     def forward(self, x):
+
         x = self.fc1(x)
         x = self.fc2(x)
+
         return x
 
 
@@ -40,6 +47,7 @@ class Expert(nn.Module):
 class ModelCNNCifar10(nn.Module):
 
     def __init__(self):
+
         super(ModelCNNCifar10, self).__init__()
 
         self.num_experts = 4
@@ -82,7 +90,12 @@ class ModelCNNCifar10(nn.Module):
         )
 
         # Router 使用较小的初始化，避免初始路由分数过大
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
+        nn.init.normal_(
+            self.router.weight,
+            mean=0.0,
+            std=0.001
+        )
+
         nn.init.zeros_(self.router.bias)
 
         # ----------------------------------------------------
@@ -100,11 +113,14 @@ class ModelCNNCifar10(nn.Module):
 
         @torch.no_grad()
         def init_weights(m):
+
             if isinstance(m, (nn.Linear, nn.Conv2d)):
+
                 nn.init.kaiming_normal_(
                     m.weight,
                     nonlinearity='relu'
                 )
+
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -116,6 +132,15 @@ class ModelCNNCifar10(nn.Module):
             expert.fc1.apply(init_weights)
 
         # 专家分类头保留 PyTorch 默认初始化
+
+        # ----------------------------------------------------
+        # 5. Expert Activation Statistics
+        # ----------------------------------------------------
+
+        self.last_expert_counts = torch.zeros(
+            self.num_experts,
+            dtype=torch.long
+        )
 
     # ========================================================
     # Forward
@@ -144,6 +169,15 @@ class ModelCNNCifar10(nn.Module):
             router_logits,
             k=self.top_k,
             dim=1
+        )
+
+        # ----------------------------------------------------
+        # 新增：统计当前 Batch 每个专家的激活次数
+        # ----------------------------------------------------
+
+        self.last_expert_counts = torch.bincount(
+            topk_indices.detach().reshape(-1),
+            minlength=self.num_experts
         )
 
         # Normalize selected routing weights

@@ -2,7 +2,10 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(
+    0,
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+)
 
 import torch
 import collections
@@ -11,14 +14,21 @@ from torch.autograd import Variable
 from torch import nn
 import copy
 
+
 LOSS_ACC_BATCH_SIZE = 128
 
 
 class Model:
 
-    def __init__(self, rand_seed=None, learning_rate=0.001,
-                 model_name=None, device=None,
-                 flatten_weight=False, pretrained_model_file=None):
+    def __init__(
+        self,
+        rand_seed=None,
+        learning_rate=0.001,
+        model_name=None,
+        device=None,
+        flatten_weight=False,
+        pretrained_model_file=None
+    ):
 
         super(Model, self).__init__()
 
@@ -38,31 +48,46 @@ class Model:
         self.learning_rate = learning_rate
 
         if model_name == 'ModelCNNMnist':
+
             from model.cnn_mnist import ModelCNNMnist
+
             self.model = ModelCNNMnist().to(device)
 
         elif model_name == 'ModelCNNCifar10':
+
             from model.cnn_cifar10 import ModelCNNCifar10
+
             self.model = ModelCNNCifar10().to(device)
 
         elif model_name == 'ModelCNNSvhn':
+
             from model.cnn_svhn import ModelCNNSvhn
+
             self.model = ModelCNNSvhn().to(device)
 
         elif model_name == 'ModelCNNCifar100':
+
             from model.cnn_cifar100 import ModelCNNCifar100
+
             self.model = ModelCNNCifar100().to(device)
 
         elif model_name == 'ModelCNNCinic10':
+
             from model.cnn_cinic10 import ModelCNNCinic10
+
             self.model = ModelCNNCinic10().to(device)
 
         else:
+
             raise Exception('Unsupported model name')
 
         if pretrained_model_file is not None:
+
             self.model.load_state_dict(
-                torch.load(pretrained_model_file, map_location=device)
+                torch.load(
+                    pretrained_model_file,
+                    map_location=device
+                )
             )
 
         self.optimizer = torch.optim.SGD(
@@ -101,8 +126,14 @@ class Model:
             self.weights_size_list.append(shape)
 
             if len(shape) > 0:
-                num_w = reduce(lambda x, y: x * y, shape)
+
+                num_w = reduce(
+                    lambda x, y: x * y,
+                    shape
+                )
+
             else:
+
                 num_w = 0
 
             self.weights_num_list.append(num_w)
@@ -123,7 +154,9 @@ class Model:
 
                 weight_flatten_tensor = torch.Tensor(
                     sum(self.weights_num_list)
-                ).to(state[self.weights_key_list[0]].device)
+                ).to(
+                    state[self.weights_key_list[0]].device
+                )
 
                 start_index = 0
 
@@ -133,7 +166,8 @@ class Model:
                 ):
 
                     weight_flatten_tensor[
-                        start_index:start_index + self.weights_num_list[i]
+                        start_index:
+                        start_index + self.weights_num_list[i]
                     ] = v.view(1, -1)
 
                     start_index += self.weights_num_list[i]
@@ -145,7 +179,7 @@ class Model:
                 return copy.deepcopy(state)
 
     # ============================================================
-    # 新增：识别专家参数
+    # 识别全部专家参数
     # True 代表专家参数
     # False 代表非专家参数
     # ============================================================
@@ -170,6 +204,56 @@ class Model:
             )
 
         return torch.cat(mask_list)
+
+    # ============================================================
+    # 新增：分别识别每个专家的参数
+    #
+    # 返回：
+    # expert_masks[0] -> Expert 0 参数
+    # expert_masks[1] -> Expert 1 参数
+    # expert_masks[2] -> Expert 2 参数
+    # expert_masks[3] -> Expert 3 参数
+    #
+    # 参数顺序与 get_weight() 完全一致
+    # ============================================================
+
+    def get_expert_weight_masks(self):
+
+        if not hasattr(self.model, 'num_experts'):
+
+            raise ValueError(
+                'The selected aggregation scheme requires a model '
+                'with num_experts.'
+            )
+
+        state = self.model.state_dict()
+
+        expert_masks = []
+
+        for expert_idx in range(self.model.num_experts):
+
+            prefix = f'experts.{expert_idx}.'
+
+            mask_list = []
+
+            for key, value in state.items():
+
+                is_this_expert = key.startswith(prefix)
+
+                mask_list.append(
+                    torch.full(
+                        (value.numel(),),
+                        is_this_expert,
+                        dtype=torch.bool,
+                        device=value.device
+                    )
+                )
+
+            expert_masks.append(
+                torch.cat(mask_list)
+            )
+
+        return expert_masks
 
     def assign_weight(self, w):
 
@@ -230,7 +314,13 @@ class Model:
 
             return imgs, labels
 
-    def accuracy(self, data_test_loader, w, device, transform=None):
+    def accuracy(
+        self,
+        data_test_loader,
+        w,
+        device,
+        transform=None
+    ):
 
         if w is not None:
 
@@ -254,7 +344,10 @@ class Model:
 
                 output = self.model(images)
 
-                avg_loss += self.loss_fn(output, labels).sum()
+                avg_loss += self.loss_fn(
+                    output,
+                    labels
+                ).sum()
 
                 pred = output.data.max(1)[1]
 
@@ -264,6 +357,9 @@ class Model:
 
         avg_loss /= len(data_test_loader.dataset)
 
-        acc = float(total_correct) / len(data_test_loader.dataset)
+        acc = (
+            float(total_correct)
+            / len(data_test_loader.dataset)
+        )
 
         return avg_loss.item(), acc

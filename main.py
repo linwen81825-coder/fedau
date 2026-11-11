@@ -10,6 +10,7 @@ import random
 from model.model import Model
 from util.util import DatasetSplit, WorkerSampler
 import copy
+import os
 
 
 if device.type != 'cpu':
@@ -146,7 +147,7 @@ if __name__ == "__main__":
         w_global = model.get_weight()
 
         # ========================================================
-        # 新增：区分专家参数和非专家参数
+        # 区分专家参数和非专家参数
         # ========================================================
 
         expert_mask = model.get_expert_weight_mask()
@@ -157,19 +158,108 @@ if __name__ == "__main__":
             "Expert mask dimension does not match model weights!"
 
         # ========================================================
+        # 新增：专家激活频率聚合方案
+        # ========================================================
+
+        track_expert_activation = (
+            weighting_method == 'adaptive'
+            and aggregation_scheme == 'shared_au_expert_freq_au'
+        )
+
+        if (
+            aggregation_scheme == 'shared_au_expert_freq_au'
+            and weighting_method != 'adaptive'
+        ):
+            raise ValueError(
+                'shared_au_expert_freq_au requires -weighting adaptive.'
+            )
+
+        expert_masks = None
+        expert_activation_log_filename = None
+
+        if track_expert_activation:
+
+            if not hasattr(model.model, 'num_experts'):
+                raise ValueError(
+                    'shared_au_expert_freq_au requires a MoE model '
+                    'with num_experts.'
+                )
+
+            expert_masks = model.get_expert_weight_masks()
+
+            if len(expert_masks) != model.model.num_experts:
+                raise ValueError(
+                    'The number of expert masks is incorrect.'
+                )
+
+            for mask in expert_masks:
+
+                if mask.numel() != w_global.numel():
+                    raise ValueError(
+                        'Expert mask dimension does not match model weights!'
+                    )
+
+            # 专家激活次数日志
+            expert_activation_log_filename = (
+                'expertActivationCounts_'
+                + results_file_prefix
+                + '.csv'
+            )
+
+            if (
+                not os.path.exists(expert_activation_log_filename)
+                or os.path.getsize(expert_activation_log_filename) == 0
+            ):
+
+                log_columns = [
+                    'sim_seed',
+                    'num_iter',
+                    'client_id',
+                    'participated',
+                    'total_activation_count'
+                ]
+
+                log_columns += [
+                    f'expert_{e}_count'
+                    for e in range(model.model.num_experts)
+                ]
+
+                log_columns += [
+                    f'expert_{e}_frequency'
+                    for e in range(model.model.num_experts)
+                ]
+
+                log_columns += [
+                    f'expert_{e}_relative_weight'
+                    for e in range(model.model.num_experts)
+                ]
+
+                with open(expert_activation_log_filename, 'a') as f:
+                    f.write(','.join(log_columns) + '\n')
+
+        # ========================================================
         # 根据 aggregation_scheme 选择 FedAvg / FedAU 参数掩码
         #
         # fedavg_all:
         #   Backbone + Router + Experts 全部使用 FedAvg
+        #
         # fedau_all:
         #   Backbone + Router + Experts 全部使用原始 FedAU
+        #
         # shared_avg_expert_au:
         #   非专家参数 FedAvg，专家参数 FedAU
+        #
         # shared_au_expert_avg:
         #   非专家参数 FedAU，专家参数 FedAvg
+        #
+        # shared_au_expert_freq_au:
+        #   非专家参数 FedAU
+        #   专家参数 FedAU × 专家激活频率
         # ========================================================
 
-        use_scheme_aggregation = (weighting_method == 'adaptive')
+        use_scheme_aggregation = (
+            weighting_method == 'adaptive'
+        )
 
         if use_scheme_aggregation:
 
@@ -178,8 +268,10 @@ if __name__ == "__main__":
 
             if aggregation_scheme in (
                 'shared_avg_expert_au',
-                'shared_au_expert_avg'
+                'shared_au_expert_avg',
+                'shared_au_expert_freq_au'
             ) and (not has_expert or not has_shared):
+
                 raise ValueError(
                     'The selected aggregation scheme requires both '
                     'expert and non-expert parameters. Check '
@@ -187,28 +279,41 @@ if __name__ == "__main__":
                 )
 
             if aggregation_scheme == 'fedavg_all':
+
                 fedavg_mask = torch.ones_like(expert_mask)
                 fedau_mask = torch.zeros_like(expert_mask)
 
             elif aggregation_scheme == 'fedau_all':
+
                 fedavg_mask = torch.zeros_like(expert_mask)
                 fedau_mask = torch.ones_like(expert_mask)
 
             elif aggregation_scheme == 'shared_avg_expert_au':
+
                 fedavg_mask = shared_mask
                 fedau_mask = expert_mask
 
             elif aggregation_scheme == 'shared_au_expert_avg':
+
                 fedavg_mask = expert_mask
                 fedau_mask = shared_mask
 
+            elif aggregation_scheme == 'shared_au_expert_freq_au':
+
+                # 所有参数先使用原始 FedAU
+                # 专家参数随后额外乘以各自的激活频率
+                fedavg_mask = torch.zeros_like(expert_mask)
+                fedau_mask = torch.ones_like(expert_mask)
+
             else:
+
                 raise ValueError(
                     'Unknown aggregation scheme: '
                     + str(aggregation_scheme)
                 )
 
         else:
+
             fedavg_mask = None
             fedau_mask = None
 
@@ -307,14 +412,29 @@ if __name__ == "__main__":
 
             if use_scheme_aggregation:
 
-                # FedAvg 参数的未加权更新累积
                 fedavg_update_sum = torch.zeros_like(w_global)
 
-                # FedAU 参数的参与间隔加权更新累积
                 fedau_update_sum = torch.zeros_like(w_global)
 
-                # 本轮实际参与训练的客户端数量
                 participating_count = 0
+
+            # ====================================================
+            # 新增：本轮客户端专家激活统计
+            # ====================================================
+
+            if track_expert_activation:
+
+                expert_activation_counts_each_node = [
+                    torch.zeros(
+                        model.model.num_experts,
+                        dtype=torch.long
+                    )
+                    for _ in range(n_nodes)
+                ]
+
+                expert_participated_each_node = [
+                    False for _ in range(n_nodes)
+                ]
 
             # ====================================================
             # 客户端本地训练
@@ -332,6 +452,18 @@ if __name__ == "__main__":
                     model.assign_weight(w_global)
 
                     model.model.train()
+
+                    # ------------------------------------------------
+                    # 新增：初始化当前客户端专家激活计数
+                    # ------------------------------------------------
+
+                    if track_expert_activation:
+
+                        local_expert_activation_counts = torch.zeros(
+                            model.model.num_experts,
+                            dtype=torch.long,
+                            device=device
+                        )
 
                     # ------------------------------------------------
                     # 本地 SGD 训练
@@ -354,11 +486,54 @@ if __name__ == "__main__":
 
                         output = model.model(images)
 
+                        # --------------------------------------------
+                        # 新增：累计本地训练中的专家激活次数
+                        # --------------------------------------------
+
+                        if track_expert_activation:
+
+                            local_expert_activation_counts += (
+                                model.model.last_expert_counts.detach()
+                            )
+
                         loss = model.loss_fn(output, labels)
 
                         loss.backward()
 
                         model.optimizer.step()
+
+                    # ------------------------------------------------
+                    # 本地训练结束，保存专家激活统计
+                    # ------------------------------------------------
+
+                    if track_expert_activation:
+
+                        expert_activation_counts_each_node[n] = (
+                            local_expert_activation_counts.detach().cpu()
+                        )
+
+                        expert_participated_each_node[n] = True
+
+                        total_activation_count = (
+                            local_expert_activation_counts.sum()
+                        )
+
+                        if total_activation_count.item() > 0:
+
+                            # 归一化激活频率
+                            expert_frequency = (
+                                model.model.num_experts
+                                * local_expert_activation_counts.float()
+                                / total_activation_count.float()
+                            )
+
+                        else:
+
+                            expert_frequency = torch.ones(
+                                model.model.num_experts,
+                                dtype=torch.float32,
+                                device=device
+                            )
 
                     # ------------------------------------------------
                     # 计算本地模型更新
@@ -378,7 +553,9 @@ if __name__ == "__main__":
 
                         w_tmp /= worker_sampler.participation_prob
 
-                        agg_weight = 1 / worker_sampler.participation_prob
+                        agg_weight = (
+                            1 / worker_sampler.participation_prob
+                        )
 
                     elif weighting_method == 'adaptive':
 
@@ -390,12 +567,10 @@ if __name__ == "__main__":
 
                             if use_scheme_aggregation:
 
-                                # 只对本实验方案中指定为 FedAU 的参数加权
                                 w_tmp[fedau_mask] *= agg_weight
 
                             else:
 
-                                # 兼容未启用参数级聚合方案的原始逻辑
                                 w_tmp *= agg_weight
 
                     elif weighting_method == 'fedvarp':
@@ -409,6 +584,20 @@ if __name__ == "__main__":
                     elif weighting_method == 'mifa':
 
                         update_per_node[n] = w_tmp.to('cpu')
+
+                    # ------------------------------------------------
+                    # 新增：专家参数乘以各自的激活频率
+                    # ------------------------------------------------
+
+                    if track_expert_activation and participated:
+
+                        for expert_idx in range(
+                            model.model.num_experts
+                        ):
+
+                            w_tmp[expert_masks[expert_idx]] *= (
+                                expert_frequency[expert_idx]
+                            )
 
                     # ------------------------------------------------
                     # 记录聚合权重和参与次数
@@ -447,6 +636,16 @@ if __name__ == "__main__":
 
                     w_tmp = 0.0
 
+                    # 未参与客户端本轮激活次数记为零
+                    if track_expert_activation:
+
+                        expert_activation_counts_each_node[n] = (
+                            torch.zeros(
+                                model.model.num_experts,
+                                dtype=torch.long
+                            )
+                        )
+
                 # ------------------------------------------------
                 # 保存聚合统计
                 # ------------------------------------------------
@@ -472,19 +671,17 @@ if __name__ == "__main__":
                         )
 
                 # =================================================
-                # 核心修改：两种参数分别累积
+                # 两种参数分别累积
                 # =================================================
 
                 if use_scheme_aggregation:
 
                     if participated:
 
-                        # FedAvg 参数：累积原始客户端更新，不乘 FedAU 权重
                         fedavg_update_sum[fedavg_mask] += (
                             w_tmp[fedavg_mask]
                         )
 
-                        # FedAU 参数：累积上面已经按参与间隔加权的更新
                         fedau_update_sum[fedau_mask] += (
                             w_tmp[fedau_mask]
                         )
@@ -492,8 +689,6 @@ if __name__ == "__main__":
                         participating_count += 1
 
                 elif weighting_method != 'mifa':
-
-                    # 其他聚合算法保持原来的累积方式
 
                     if accumulated == 0:
 
@@ -518,6 +713,73 @@ if __name__ == "__main__":
             # 本轮客户端遍历结束
             # ====================================================
 
+            # ----------------------------------------------------
+            # 新增：保存本轮所有客户端的专家激活日志
+            # ----------------------------------------------------
+
+            if track_expert_activation:
+
+                with open(
+                    expert_activation_log_filename,
+                    'a'
+                ) as f:
+
+                    for n in range(n_nodes):
+
+                        counts = (
+                            expert_activation_counts_each_node[n]
+                        )
+
+                        total_count = int(counts.sum().item())
+
+                        if total_count > 0:
+
+                            frequencies = (
+                                counts.float() / total_count
+                            )
+
+                            relative_weights = (
+                                model.model.num_experts
+                                * frequencies
+                            )
+
+                        else:
+
+                            frequencies = torch.zeros(
+                                model.model.num_experts,
+                                dtype=torch.float32
+                            )
+
+                            relative_weights = torch.zeros_like(
+                                frequencies
+                            )
+
+                        row = [
+                            seed,
+                            num_iter,
+                            n,
+                            int(expert_participated_each_node[n]),
+                            total_count
+                        ]
+
+                        row += counts.tolist()
+
+                        row += [
+                            float(x)
+                            for x in frequencies.tolist()
+                        ]
+
+                        row += [
+                            float(x)
+                            for x in relative_weights.tolist()
+                        ]
+
+                        f.write(
+                            ','.join(
+                                str(x) for x in row
+                            ) + '\n'
+                        )
+
             if save_agg_weight:
 
                 with open(agg_weight_filename, 'a') as f:
@@ -527,7 +789,7 @@ if __name__ == "__main__":
                     f.write('\n')
 
             # ====================================================
-            # 核心修改：分别聚合非专家参数和专家参数
+            # 分别聚合非专家参数和专家参数
             # ====================================================
 
             if use_scheme_aggregation:
@@ -535,8 +797,7 @@ if __name__ == "__main__":
                 w_tmp_a = torch.zeros_like(w_global)
 
                 # ------------------------------------------------
-                # FedAvg 参数：
-                # 对本轮实际参与训练的客户端更新求平均
+                # FedAvg 参数
                 # ------------------------------------------------
 
                 if participating_count > 0:
@@ -547,9 +808,7 @@ if __name__ == "__main__":
                     )
 
                 # ------------------------------------------------
-                # FedAU 参数：
-                # 使用原始 Adaptive FedAU 的总客户端数归一化
-                # 未参与客户端的更新视为零
+                # FedAU 参数
                 # ------------------------------------------------
 
                 w_tmp_a[fedau_mask] = (
@@ -557,10 +816,6 @@ if __name__ == "__main__":
                 )
 
             elif weighting_method != 'mifa':
-
-                # ------------------------------------------------
-                # 其他聚合方式保持原始逻辑
-                # ------------------------------------------------
 
                 if accumulated > 0:
 
