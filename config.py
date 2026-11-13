@@ -37,7 +37,8 @@ parser.add_argument(
         'fedau_all',
         'shared_avg_expert_au',
         'shared_au_expert_avg',
-        'shared_au_expert_freq_au'
+        'shared_au_expert_freq_au',
+        'shared_au_expert_freq_scale_norm'
     ],
     help='Parameter-wise aggregation scheme used when -weighting adaptive.'
 )

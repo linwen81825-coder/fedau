@@ -146,22 +146,52 @@ if __name__ == "__main__":
         assert expert_mask.numel() == w_global.numel(), \
             "Expert mask dimension does not match model weights!"
 
-        # Keep the original af838a expert-activation FedAU scheme.
+        # Both expert-frequency variants share the same activation counts.
+        expert_frequency_schemes = (
+            'shared_au_expert_freq_au',
+            'shared_au_expert_freq_scale_norm',
+        )
+        scale_preserving_expert_freq = (
+            aggregation_scheme == 'shared_au_expert_freq_scale_norm'
+        )
         track_expert_activation = (
             weighting_method == 'adaptive'
-            and aggregation_scheme == 'shared_au_expert_freq_au'
+            and aggregation_scheme in expert_frequency_schemes
         )
 
         if (
-            aggregation_scheme == 'shared_au_expert_freq_au'
+            aggregation_scheme in expert_frequency_schemes
             and weighting_method != 'adaptive'
         ):
             raise ValueError(
-                'shared_au_expert_freq_au requires -weighting adaptive.'
+                'Expert-frequency aggregation requires -weighting adaptive.'
             )
 
         expert_masks = None
         expert_activation_log_filename = None
+
+        # Optional diagnostics: one summary row per communication round.
+        scale_norm_log_filename = None
+        if scale_preserving_expert_freq:
+            scale_norm_log_filename = (
+                'expertScaleNormStats_' + results_file_prefix + '.csv'
+            )
+            if (
+                not os.path.exists(scale_norm_log_filename)
+                or os.path.getsize(scale_norm_log_filename) == 0
+            ):
+                with open(scale_norm_log_filename, 'a', encoding='utf-8') as f:
+                    columns = [
+                        'sim_seed', 'num_iter', 'participating_clients',
+                        'sum_fedau_weights',
+                    ]
+                    columns += [
+                        f'expert_{e}_sum_fedau_times_freq' for e in range(4)
+                    ]
+                    columns += [
+                        f'expert_{e}_normalization_factor' for e in range(4)
+                    ]
+                    f.write(','.join(columns) + '\n')
 
         if track_expert_activation:
             if not hasattr(model.model, 'num_experts'):
@@ -219,7 +249,8 @@ if __name__ == "__main__":
             if aggregation_scheme in (
                 'shared_avg_expert_au',
                 'shared_au_expert_avg',
-                'shared_au_expert_freq_au'
+                'shared_au_expert_freq_au',
+                'shared_au_expert_freq_scale_norm'
             ) and (not has_expert or not has_shared):
                 raise ValueError(
                     'The selected aggregation scheme requires both '
@@ -239,9 +270,10 @@ if __name__ == "__main__":
             elif aggregation_scheme == 'shared_au_expert_avg':
                 fedavg_mask = expert_mask
                 fedau_mask = shared_mask
-            elif aggregation_scheme == 'shared_au_expert_freq_au':
-                # Shared parameters use original FedAU. Expert parameters
-                # also start with FedAU, then receive activation weighting.
+            elif aggregation_scheme in expert_frequency_schemes:
+                # Shared parameters always use original FedAU.
+                # Expert parameters additionally use client activation frequency;
+                # the scale-normalized variant restores original FedAU mass.
                 fedavg_mask = torch.zeros_like(expert_mask)
                 fedau_mask = torch.ones_like(expert_mask)
             else:
@@ -327,6 +359,17 @@ if __name__ == "__main__":
                 fedavg_update_sum = torch.zeros_like(w_global)
                 fedau_update_sum = torch.zeros_like(w_global)
                 participating_count = 0
+
+            if scale_preserving_expert_freq:
+                # A = sum_{i in S_t} a_i, and B_e = sum_i a_i * r_{i,e}.
+                # The weighted expert deltas are already added to
+                # fedau_update_sum below; normalize them after all clients.
+                round_fedau_weight_sum = 0.0
+                round_expert_weighted_mass = torch.zeros(
+                    model.model.num_experts,
+                    dtype=torch.float64,
+                    device=device
+                )
 
             if track_expert_activation:
                 expert_activation_counts_each_node = [
@@ -453,8 +496,23 @@ if __name__ == "__main__":
                                 device=device
                             )
 
-                        # Apply the client-specific activation frequency
-                        # to each expert's own parameter block.
+                        # a_i is the actual FedAU coefficient used above:
+                        # 1 for the first participation (no interval history),
+                        # otherwise mean observed participation interval.
+                        if scale_preserving_expert_freq:
+                            effective_fedau_weight = (
+                                float(agg_weight)
+                                if agg_weight is not None else 1.0
+                            )
+                            round_fedau_weight_sum += effective_fedau_weight
+                            round_expert_weighted_mass += (
+                                effective_fedau_weight
+                                * expert_frequency.detach().to(torch.float64)
+                            )
+
+                        # All expert deltas first receive a_i * r_{i,e}.
+                        # In the scale-preserving scheme, multiply the round
+                        # expert sum by A / B_e at the aggregation stage.
                         for expert_idx in range(model.model.num_experts):
                             w_tmp[expert_masks[expert_idx]] *= (
                                 expert_frequency[expert_idx]
@@ -557,6 +615,28 @@ if __name__ == "__main__":
                 with open(participation_count_filename, 'a') as f:
                     f.write('\n')
 
+            # Scale-preserving frequency weighting, for each expert e:
+            #   W_{i,e} = a_i * r_{i,e} / B_e * A
+            # where A = sum_{j in S_t} a_j, B_e = sum_{j in S_t} a_j*r_{j,e}.
+            # The original FedAU denominator n_nodes is preserved below.
+            scale_norm_factors = None
+            if scale_preserving_expert_freq:
+                scale_norm_factors = []
+                for expert_idx in range(model.model.num_experts):
+                    expert_mass = float(
+                        round_expert_weighted_mass[expert_idx].item()
+                    )
+                    if expert_mass > 0.0:
+                        scale_factor = round_fedau_weight_sum / expert_mass
+                        fedau_update_sum[expert_masks[expert_idx]] *= (
+                            scale_factor
+                        )
+                    else:
+                        # No client used this expert in this round: B_e = 0.
+                        # There is no supported expert delta to aggregate.
+                        scale_factor = 0.0
+                    scale_norm_factors.append(scale_factor)
+
             # Aggregate parameter groups.
             if use_scheme_aggregation:
                 w_tmp_a = torch.zeros_like(w_global)
@@ -594,6 +674,16 @@ if __name__ == "__main__":
             )
 
             num_iter = num_iter + iters_per_round
+
+            if scale_preserving_expert_freq:
+                with open(scale_norm_log_filename, 'a', encoding='utf-8') as f:
+                    row = [
+                        seed, num_iter, participating_count,
+                        round_fedau_weight_sum,
+                    ]
+                    row += round_expert_weighted_mass.tolist()
+                    row += scale_norm_factors
+                    f.write(','.join(str(x) for x in row) + '\n')
 
             if router_balance_logging:
                 # Explicitly record zero values if no client participated.
