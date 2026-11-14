@@ -12,6 +12,43 @@ import copy
 import os
 
 
+def normalize_expert_gradients_by_activation(model, batch_size):
+    """
+    Normalize each expert's parameter gradients by its Top-k activation count
+    in the current minibatch.
+
+    With a mean-reduced batch loss:
+        grad_e = (1 / B) * sum_{b: e selected} grad_{b,e}
+
+    Multiplying by B / n_e changes this to the average gradient over samples
+    that selected expert e. Router weights remain inside each sample gradient.
+    """
+    if not hasattr(model, 'experts') or not hasattr(model, 'last_expert_counts'):
+        raise ValueError(
+            'Activation-count gradient normalization requires a sparse MoE '
+            'model exposing experts and last_expert_counts.'
+        )
+
+    counts = model.last_expert_counts.detach()
+    if counts.numel() != len(model.experts):
+        raise ValueError(
+            'last_expert_counts does not match the number of experts.'
+        )
+
+    # An unselected expert has no gradient (grad is None). clamp_min(1)
+    # prevents division by zero; the scale for an unselected expert is unused.
+    scales = (
+        float(batch_size)
+        / counts.clamp_min(1).to(dtype=torch.float32)
+    )
+
+    for expert_idx, expert in enumerate(model.experts):
+        scale = scales[expert_idx]
+        for parameter in expert.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale.to(dtype=parameter.grad.dtype))
+
+    
 if device.type != 'cpu':
     torch.cuda.set_device(device)
 
@@ -165,6 +202,13 @@ if __name__ == "__main__":
         ):
             raise ValueError(
                 'Expert-frequency aggregation requires -weighting adaptive.'
+            )
+
+        if expert_grad_activation_normalize and not track_expert_activation:
+            raise ValueError(
+                'Expert gradient activation normalization requires '
+                'shared_au_expert_freq_au or '
+                'shared_au_expert_freq_scale_norm with -weighting adaptive.'
             )
 
         expert_masks = None
@@ -443,6 +487,17 @@ if __name__ == "__main__":
                             round_batches += 1
 
                         loss.backward()
+
+                        # Normalize ONLY expert parameter gradients.
+                        # For mean-reduced CE, multiplying by B / n_e turns
+                        # the batch-mean gradient into the mean over samples
+                        # that selected expert e. Router weights alpha_{b,e}
+                        # remain part of each sample's gradient.
+                        if expert_grad_activation_normalize:
+                            normalize_expert_gradients_by_activation(
+                                model.model,
+                                int(images.size(0))
+                            )
 
                         model.optimizer.step()
 

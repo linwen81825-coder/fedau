@@ -28,6 +28,19 @@ parser.add_argument(
     help='Write a compact CSV of router loads without printing extra console lines.'
 )
 
+# Normalize each expert's parameter gradients by B / n_e after backward().
+parser.add_argument(
+    '-expert-grad-activation-normalize',
+    type=int,
+    choices=[0, 1],
+    default=0,
+    help=(
+        'Apply per-minibatch expert gradient normalization by '
+        'batch_size / Top-k activation count. Requires an expert-frequency '
+        'aggregation scheme.'
+    )
+)
+
 parser.add_argument(
     '-aggregation-scheme',
     type=str,
@@ -80,6 +93,11 @@ router_balance_lambda = args.router_balance_lambda
 router_balance_log = bool(args.router_balance_log)
 if router_balance_lambda < 0:
     parser.error('-router-balance-lambda must be nonnegative')
+
+expert_grad_activation_normalize = bool(
+    args.expert_grad_activation_normalize
+)
+
 k_value = args.k_adaptive
 participation_method = args.participation
 
@@ -114,6 +132,24 @@ elif args.data == 'cinic10':
     model_name = 'ModelCNNCinic10'
 else:
     raise Exception('Unknown data name')
+
+if expert_grad_activation_normalize:
+    if model_name != 'ModelCNNCifar10':
+        parser.error(
+            'Expert gradient activation normalization is currently '
+            'implemented only for ModelCNNCifar10.'
+        )
+    if (
+        weighting_method != 'adaptive'
+        or aggregation_scheme not in (
+            'shared_au_expert_freq_au',
+            'shared_au_expert_freq_scale_norm'
+        )
+    ):
+        parser.error(
+            'Expert gradient activation normalization requires '
+            '-weighting adaptive and an expert-frequency aggregation scheme.'
+        )
 
 max_iter = args.iters_total
 simulations_str = args.seeds.split(',')
@@ -168,6 +204,9 @@ results_file_prefix += '_scheme_' + aggregation_scheme
 # Keep results from LB-on and LB-off experiments separate even if -out is reused.
 if router_balance_lambda > 0:
     results_file_prefix += '_routerLB' + str(router_balance_lambda)
+
+if expert_grad_activation_normalize:
+    results_file_prefix += '_expertGradActNorm'
 
 save_model_file = results_file_prefix + '.model'
 
