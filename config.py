@@ -37,9 +37,15 @@ parser.add_argument(
         'fedau_all',
         'shared_avg_expert_au',
         'shared_au_expert_avg',
-        'shared_au_expert_freq_au'
+        'shared_au_expert_freq_au',
+        'expert_freq_all',
+        'shared_avg_expert_freq'
     ],
-    help='Parameter-wise aggregation scheme used when -weighting adaptive.'
+    help=(
+        'Parameter-wise aggregation scheme used when -weighting adaptive. '
+        'shared_avg_expert_freq uses FedAvg for shared parameters and '
+        'per-expert activation-frequency weighting for expert parameters.'
+    )
 )
 parser.add_argument('-k-adaptive', type=int, default=100000)  # cutoff interval length, only used by the adaptive method
 parser.add_argument('-participation', type=str, default='bernoulli')  # bernoulli, markov, cyclic

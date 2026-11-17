@@ -146,18 +146,40 @@ if __name__ == "__main__":
         assert expert_mask.numel() == w_global.numel(), \
             "Expert mask dimension does not match model weights!"
 
-        # Keep the original af838a expert-activation FedAU scheme.
+        # Expert activation statistics are used by all activation-frequency schemes.
+        # expert_freq_all: both shared and expert parameters use activation counts.
+        # shared_avg_expert_freq: shared parameters use FedAvg; experts use
+        # per-expert activation-count weights. Neither scheme applies FedAU intervals.
+        use_expert_freq_all = (
+            weighting_method == 'adaptive'
+            and aggregation_scheme == 'expert_freq_all'
+        )
+        use_shared_avg_expert_freq = (
+            weighting_method == 'adaptive'
+            and aggregation_scheme == 'shared_avg_expert_freq'
+        )
+        use_activation_freq_experts = (
+            use_expert_freq_all or use_shared_avg_expert_freq
+        )
         track_expert_activation = (
             weighting_method == 'adaptive'
-            and aggregation_scheme == 'shared_au_expert_freq_au'
+            and aggregation_scheme in (
+                'shared_au_expert_freq_au',
+                'expert_freq_all',
+                'shared_avg_expert_freq'
+            )
         )
 
         if (
-            aggregation_scheme == 'shared_au_expert_freq_au'
+            aggregation_scheme in (
+                'shared_au_expert_freq_au',
+                'expert_freq_all',
+                'shared_avg_expert_freq'
+            )
             and weighting_method != 'adaptive'
         ):
             raise ValueError(
-                'shared_au_expert_freq_au requires -weighting adaptive.'
+                aggregation_scheme + ' requires -weighting adaptive.'
             )
 
         expert_masks = None
@@ -207,6 +229,8 @@ if __name__ == "__main__":
                     f'expert_{e}_relative_weight'
                     for e in range(model.model.num_experts)
                 ]
+                if use_activation_freq_experts:
+                    log_columns += ['shared_relative_weight']
                 with open(expert_activation_log_filename, 'a') as f:
                     f.write(','.join(log_columns) + '\n')
 
@@ -219,7 +243,9 @@ if __name__ == "__main__":
             if aggregation_scheme in (
                 'shared_avg_expert_au',
                 'shared_au_expert_avg',
-                'shared_au_expert_freq_au'
+                'shared_au_expert_freq_au',
+                'expert_freq_all',
+                'shared_avg_expert_freq'
             ) and (not has_expert or not has_shared):
                 raise ValueError(
                     'The selected aggregation scheme requires both '
@@ -244,6 +270,16 @@ if __name__ == "__main__":
                 # also start with FedAU, then receive activation weighting.
                 fedavg_mask = torch.zeros_like(expert_mask)
                 fedau_mask = torch.ones_like(expert_mask)
+            elif aggregation_scheme == 'expert_freq_all':
+                # Shared and expert parameter groups are both aggregated
+                # directly with activation-count weights below.
+                fedavg_mask = shared_mask
+                fedau_mask = expert_mask
+            elif aggregation_scheme == 'shared_avg_expert_freq':
+                # Shared parameters use FedAvg; each expert uses its own
+                # activation-count weights in the custom aggregation below.
+                fedavg_mask = shared_mask
+                fedau_mask = expert_mask
             else:
                 raise ValueError(
                     'Unknown aggregation scheme: ' + str(aggregation_scheme)
@@ -324,9 +360,21 @@ if __name__ == "__main__":
                 round_batches = 0
 
             if use_scheme_aggregation:
-                fedavg_update_sum = torch.zeros_like(w_global)
-                fedau_update_sum = torch.zeros_like(w_global)
-                participating_count = 0
+                if use_activation_freq_experts:
+                    expert_freq_update_sum = torch.zeros_like(w_global)
+                    expert_freq_weight_sum = [
+                        0.0 for _ in range(model.model.num_experts)
+                    ]
+                    if use_expert_freq_all:
+                        shared_freq_update_sum = torch.zeros_like(w_global)
+                        shared_freq_weight_sum = 0.0
+                    else:
+                        shared_avg_update_sum = torch.zeros_like(w_global)
+                        shared_avg_participating_count = 0
+                else:
+                    fedavg_update_sum = torch.zeros_like(w_global)
+                    fedau_update_sum = torch.zeros_like(w_global)
+                    participating_count = 0
 
             if track_expert_activation:
                 expert_activation_counts_each_node = [
@@ -419,7 +467,11 @@ if __name__ == "__main__":
                         agg_weight = 1 / worker_sampler.participation_prob
 
                     elif weighting_method == 'adaptive':
-                        if len(participate_intervals_at_node[n]) > 0:
+                        if use_activation_freq_experts:
+                            # Activation-frequency schemes do not apply the
+                            # adaptive participation-interval (FedAU) weight.
+                            agg_weight = None
+                        elif len(participate_intervals_at_node[n]) > 0:
                             agg_weight = np.mean(
                                 participate_intervals_at_node[n]
                             )
@@ -436,7 +488,7 @@ if __name__ == "__main__":
                     elif weighting_method == 'mifa':
                         update_per_node[n] = w_tmp.to('cpu')
 
-                    if track_expert_activation:
+                    if track_expert_activation and not use_activation_freq_experts:
                         total_activation_count = (
                             local_expert_activation_counts.sum()
                         )
@@ -453,8 +505,8 @@ if __name__ == "__main__":
                                 device=device
                             )
 
-                        # Apply the client-specific activation frequency
-                        # to each expert's own parameter block.
+                        # Preserve the original scheme: apply each client's
+                        # relative expert frequency to that expert's parameters.
                         for expert_idx in range(model.model.num_experts):
                             w_tmp[expert_masks[expert_idx]] *= (
                                 expert_frequency[expert_idx]
@@ -500,15 +552,58 @@ if __name__ == "__main__":
 
                 if use_scheme_aggregation:
                     if participated:
-                        fedavg_update_sum[fedavg_mask] += (
-                            w_tmp[fedavg_mask]
-                        )
+                        if use_activation_freq_experts:
+                            activation_counts = (
+                                expert_activation_counts_each_node[n].to(
+                                    device=w_global.device,
+                                    dtype=w_global.dtype
+                                )
+                            )
 
-                        fedau_update_sum[fedau_mask] += (
-                            w_tmp[fedau_mask]
-                        )
+                            if use_expert_freq_all:
+                                # Shared parameters use total expert activations.
+                                total_activation_count = activation_counts.sum()
+                                if total_activation_count.item() > 0:
+                                    shared_freq_update_sum[shared_mask] += (
+                                        w_tmp[shared_mask] * total_activation_count
+                                    )
+                                    shared_freq_weight_sum += float(
+                                        total_activation_count.item()
+                                    )
+                            else:
+                                # Shared parameters use ordinary FedAvg over
+                                # clients that participated in this round.
+                                shared_avg_update_sum[shared_mask] += (
+                                    w_tmp[shared_mask]
+                                )
+                                shared_avg_participating_count += 1
 
-                        participating_count += 1
+                            # Each expert has an independent activation-count
+                            # denominator across all participating clients.
+                            for expert_idx in range(model.model.num_experts):
+                                expert_count = float(
+                                    activation_counts[expert_idx].item()
+                                )
+                                if expert_count > 0:
+                                    expert_freq_update_sum[
+                                        expert_masks[expert_idx]
+                                    ] += (
+                                        w_tmp[expert_masks[expert_idx]]
+                                        * expert_count
+                                    )
+                                    expert_freq_weight_sum[expert_idx] += (
+                                        expert_count
+                                    )
+                        else:
+                            fedavg_update_sum[fedavg_mask] += (
+                                w_tmp[fedavg_mask]
+                            )
+
+                            fedau_update_sum[fedau_mask] += (
+                                w_tmp[fedau_mask]
+                            )
+
+                            participating_count += 1
 
                 elif weighting_method != 'mifa':
                     if accumulated == 0:
@@ -524,23 +619,57 @@ if __name__ == "__main__":
                     elif participated:
                         accumulated += 1
 
-            # Original activation-frequency logging, client by client.
+            # Activation-frequency logging, client by client.
             if track_expert_activation:
+                round_expert_totals = torch.stack(
+                    expert_activation_counts_each_node
+                ).sum(dim=0).float()
+                round_total_activations = float(
+                    round_expert_totals.sum().item()
+                )
+
                 with open(expert_activation_log_filename, 'a') as f:
                     for n in range(n_nodes):
                         counts = expert_activation_counts_each_node[n]
                         total_count = int(counts.sum().item())
                         if total_count > 0:
                             frequencies = counts.float() / total_count
-                            relative_weights = (
-                                model.model.num_experts * frequencies
-                            )
                         else:
                             frequencies = torch.zeros(
                                 model.model.num_experts,
                                 dtype=torch.float32
                             )
-                            relative_weights = torch.zeros_like(frequencies)
+
+                        if use_activation_freq_experts:
+                            # Actual normalized server weight for each expert.
+                            relative_weights = torch.where(
+                                round_expert_totals > 0,
+                                counts.float() / round_expert_totals.clamp(min=1),
+                                torch.zeros_like(round_expert_totals)
+                            )
+                            if use_expert_freq_all:
+                                shared_relative_weight = (
+                                    total_count / round_total_activations
+                                    if round_total_activations > 0 else 0.0
+                                )
+                            else:
+                                round_participating_count = sum(
+                                    expert_participated_each_node
+                                )
+                                shared_relative_weight = (
+                                    1.0 / round_participating_count
+                                    if expert_participated_each_node[n]
+                                    and round_participating_count > 0
+                                    else 0.0
+                                )
+                        else:
+                            # Preserve the original scheme's local frequency
+                            # multipliers for backward-compatible logging.
+                            relative_weights = (
+                                model.model.num_experts * frequencies
+                            )
+                            shared_relative_weight = None
+
                         row = [
                             seed, num_iter, n,
                             int(expert_participated_each_node[n]),
@@ -549,6 +678,8 @@ if __name__ == "__main__":
                         row += counts.tolist()
                         row += [float(x) for x in frequencies.tolist()]
                         row += [float(x) for x in relative_weights.tolist()]
+                        if use_activation_freq_experts:
+                            row += [shared_relative_weight]
                         f.write(','.join(str(x) for x in row) + '\n')
 
             if save_agg_weight:
@@ -561,16 +692,43 @@ if __name__ == "__main__":
             if use_scheme_aggregation:
                 w_tmp_a = torch.zeros_like(w_global)
 
-                if participating_count > 0:
-                    w_tmp_a[fedavg_mask] = (
-                        fedavg_update_sum[fedavg_mask]
-                        / participating_count
-                    )
+                if use_activation_freq_experts:
+                    if use_expert_freq_all:
+                        # Shared parameters use the total activation count.
+                        if shared_freq_weight_sum > 0:
+                            w_tmp_a[shared_mask] = (
+                                shared_freq_update_sum[shared_mask]
+                                / shared_freq_weight_sum
+                            )
+                    else:
+                        # Shared parameters use FedAvg over participating clients.
+                        if shared_avg_participating_count > 0:
+                            w_tmp_a[shared_mask] = (
+                                shared_avg_update_sum[shared_mask]
+                                / shared_avg_participating_count
+                            )
 
-                # Original Adaptive FedAU denominator (all clients).
-                w_tmp_a[fedau_mask] = (
-                    fedau_update_sum[fedau_mask] / n_nodes
-                )
+                    # Each expert is normalized independently. If no client
+                    # activated an expert this round, its update stays zero.
+                    for expert_idx in range(model.model.num_experts):
+                        expert_weight_sum = expert_freq_weight_sum[expert_idx]
+                        if expert_weight_sum > 0:
+                            w_tmp_a[expert_masks[expert_idx]] = (
+                                expert_freq_update_sum[
+                                    expert_masks[expert_idx]
+                                ] / expert_weight_sum
+                            )
+                else:
+                    if participating_count > 0:
+                        w_tmp_a[fedavg_mask] = (
+                            fedavg_update_sum[fedavg_mask]
+                            / participating_count
+                        )
+
+                    # Original Adaptive FedAU denominator (all clients).
+                    w_tmp_a[fedau_mask] = (
+                        fedau_update_sum[fedau_mask] / n_nodes
+                    )
 
             elif weighting_method != 'mifa':
                 if accumulated > 0:
