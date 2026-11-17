@@ -112,11 +112,13 @@ class ModelCNNCifar10(nn.Module):
         # p_e: mean FULL-softmax router probability for expert e.
         # L_balance = E * sum_e f_e * p_e (balanced reference ~1).
         #
-        # Hard Top-k selection is non-differentiable, so f_e is constant;
-        # p_e stays in the computation graph and gives router gradients.
+        # Hard Top-k selection is non-differentiable, so f_e is constant.
+        # The auxiliary loss uses detached Backbone features, so its
+        # gradients update the Router but do not update the Backbone.
         # Do NOT use the selected-only Top-2 softmax for p_e.
         # ========================================================
-        full_router_probs = F.softmax(router_logits, dim=1)
+        balance_router_logits = self.router(features.detach())
+        full_router_probs = F.softmax(balance_router_logits, dim=1)
         hard_load = self.last_expert_counts.to(
             device=router_logits.device, dtype=router_logits.dtype
         ) / float(batch_size * self.top_k)
